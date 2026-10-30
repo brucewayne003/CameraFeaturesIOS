@@ -203,7 +203,9 @@ public final class CameraManager: NSObject, ObservableObject {
         // Front-camera integrations must never silently turn on the rear camera.
         if settings.device?.position == .front { return settings.device }
         let devices = Self.discoverVideoCaptureDevices(position: .back)
-        let preferredTypes: [AVCaptureDevice.DeviceType] = [.builtInDualWideCamera, .builtInTripleCamera]
+        // Compare native handover using the full rear-camera group on Pro
+        // devices, retaining dual-wide as the fallback on other devices.
+        let preferredTypes: [AVCaptureDevice.DeviceType] = [.builtInTripleCamera, .builtInDualWideCamera]
         for type in preferredTypes {
             if let device = devices.first(where: {
                 $0.deviceType == type &&
