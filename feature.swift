@@ -142,6 +142,7 @@ public final class CameraManager: NSObject, ObservableObject {
     }
     internal var usesAutomaticCameraMode: Bool { lensSwitchingMode == .automatic }
     private var nativeCameraObservations = [NSKeyValueObservation]()
+    private var nativeFocusPositionCancellables = Set<AnyCancellable>()
     private var nativeCameraObservationID = UUID()
     private var nativeCameraLoggingEnabled = false
 
@@ -258,6 +259,7 @@ public final class CameraManager: NSObject, ObservableObject {
     private func stopNativeCameraDiagnostics() {
         nativeCameraObservationID = UUID()
         nativeCameraObservations.removeAll()
+        nativeFocusPositionCancellables.removeAll()
     }
 
     private func startNativeCameraDiagnostics(for device: AVCaptureDevice) {
@@ -282,6 +284,53 @@ public final class CameraManager: NSObject, ObservableObject {
                 self?.recordNativeCameraEvent(event, for: device, observationID: observationID)
             })
         }
+
+        // Observe both the combined camera and its physical lenses: focus can
+        // move without isAdjustingFocus reporting a contrast-detection scan.
+        nativeCameraTrace("FOCUS position diagnostics: changes logged at most once every 200ms per source; position is a lens setting, not subject distance or proof of sharpness")
+        var observedDeviceIDs = Set<String>()
+        for source in [device] + device.constituentDevices {
+            guard observedDeviceIDs.insert(source.uniqueID).inserted else { continue }
+            observeNativeFocusPosition(on: source, sessionDevice: device, observationID: observationID)
+        }
+    }
+
+    private func observeNativeFocusPosition(on source: AVCaptureDevice, sessionDevice: AVCaptureDevice, observationID: UUID) {
+        let sourceName = source.deviceType.rawValue
+        let scope = source.isVirtualDevice ? "virtual" : "physical"
+        source.publisher(for: \.lensPosition, options: [.initial, .new])
+            .removeDuplicates()
+            .map { position in
+                // Capture values before throttling, rather than reading a newer
+                // position later and attaching an older timestamp to it.
+                let eventTime = ProcessInfo.processInfo.systemUptime
+                let primary = sessionDevice.isVirtualDevice ? sessionDevice.activePrimaryConstituent : sessionDevice
+                return (time: eventTime, position: position,
+                        activeLens: primary?.deviceType.rawValue ?? "none",
+                        isPrimary: primary?.uniqueID == source.uniqueID,
+                        autoFocusSystem: Self.nativeAutoFocusSystemName(for: source))
+            }
+            // Only diagnostic output is throttled. latest:true also delivers the
+            // final pending sample when focus motion stops between log windows.
+            .throttle(for: .milliseconds(200), scheduler: sessionQueue, latest: true)
+            .sink { [weak self] sample in
+                guard let self = self, self.nativeCameraObservationID == observationID,
+                      self.usesAutomaticCameraMode, self.nativeCameraLoggingEnabled,
+                      self.currentDevice?.uniqueID == sessionDevice.uniqueID else { return }
+                let position = String(format: "%.4f", sample.position)
+                let deliveryMilliseconds = Int((ProcessInfo.processInfo.systemUptime - sample.time) * 1_000)
+                self.nativeCameraTrace("FOCUS position sample, source=\(sourceName), scope=\(scope), primary=\(sample.isPrimary), activeLens=\(sample.activeLens), position=\(position), autoFocusSystem=\(sample.autoFocusSystem), sample_to_log_ms=\(deliveryMilliseconds) (includes diagnostic throttling)", at: sample.time)
+            }
+            .store(in: &nativeFocusPositionCancellables)
+    }
+
+    private static func nativeAutoFocusSystemName(for device: AVCaptureDevice) -> String {
+        switch device.activeFormat.autoFocusSystem {
+        case .none: return "none"
+        case .contrastDetection: return "contrastDetection"
+        case .phaseDetection: return "phaseDetection"
+        @unknown default: return "unknown"
+        }
     }
 
     private func recordNativeCameraEvent(_ event: String, for device: AVCaptureDevice, observationID: UUID) {
@@ -302,7 +351,7 @@ public final class CameraManager: NSObject, ObservableObject {
         let focus = device.focusMode == .continuousAutoFocus ? "continuous" : (device.focusMode == .autoFocus ? "once" : "locked")
         let range = device.autoFocusRangeRestriction == .none ? "none" : (device.autoFocusRangeRestriction == .near ? "near" : "far")
         let point = device.focusPointOfInterest
-        return "device=\(device.deviceType.rawValue), lens=\(lens), rawZoom=\(device.videoZoomFactor), focus=\(focus), range=\(range), smooth=\(device.isSmoothAutoFocusEnabled), point=(\(point.x),\(point.y)), lensPosition=\(device.lensPosition), adjustingFocus=\(device.isAdjustingFocus), adjustingExposure=\(device.isAdjustingExposure)"
+        return "device=\(device.deviceType.rawValue), lens=\(lens), rawZoom=\(device.videoZoomFactor), focus=\(focus), range=\(range), smooth=\(device.isSmoothAutoFocusEnabled), point=(\(point.x),\(point.y)), lensPosition=\(device.lensPosition), autoFocusSystem=\(nativeAutoFocusSystemName(for: device)), adjustingFocus=\(device.isAdjustingFocus), adjustingExposure=\(device.isAdjustingExposure)"
     }
 
     private func traceNativeCameraSettings(_ event: String, for device: AVCaptureDevice) {
