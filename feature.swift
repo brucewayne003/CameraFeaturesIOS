@@ -1,845 +1,434 @@
 //
-//  OsirisScannerViewController.swift
+//  OsirisScannerView.swift
 //  FirebaseCore
 //
 //  Created by Kyle McGinnis on 2/1/24.
 //
 
 import AVFoundation
-import Combine
-import Foundation
 import Osiris
-import OsirisBarcode
+import SwiftUI
 import UIKit
 
-public typealias BarcodeValue = String
-
-/// `OsirisScannerDelegate` delegate functions for receiving of barcode values, errors, and lifecycle events
-/// This needs to be set immediately after `OsirisScannerViewController` is instantiated in order to receive all events
-public protocol OsirisScannerDelegate: AnyObject {
-    func didTapDetectedBarcodeBoundingBox(_ barcode: Barcode, setBoundingBoxSettings: @escaping (_ settings: OsirisBoundingBoxConfig) -> Void)
-    func didDetectBarcodes(_ barcodes: [Barcode], setBoundingBoxesSettings: @escaping (_ settings: [BarcodeValue: OsirisBoundingBoxConfig]) -> Void)
-    func didDetectBarcode(_ barcode: Barcode)
-    func didFireEvent(_ event: OsirisEvent)
-    func didReceiveError(_ error: Error)
-    func cameraIdleDetected()
-}
-
-/// `OsirisScannerViewController` main object to allow for camaera display and decoding of barcodes.  This needs to be initialized and added to the view hierarchy of the embedding App's controller.
-/// `OsirisScannerDelegate` functions can be accessed after setting the `delegate` to allow for reading of Barcodes, accessing lifecycle events, and receiving errors.
-public final class OsirisScannerViewController: UIViewController {
+public class OsirisScannerView: UIView {
     
-    // MARK: Public Properties
+    // MARK: Properties
     
-    var frameCounter = 0
-    
-    /// Delegates barcode detection, events and errors
-    /// This needs to be set immediately after `OsirisScannerViewController` is instantiated in order to receive all events
-    public weak var delegate: OsirisScannerDelegate? {
+    var videoPreviewLayer: AVCaptureVideoPreviewLayer? {
         didSet {
-            delegateDidUpdate()
+            setupPreviewLayer()
+            setupOverlays()
         }
     }
     
-    /// The name of the current decoder in use by the scanner
-    public var decoderID: String {
-        // Are we going to expose this?  Are we ok with that?
-        viewModel.title
+    // Default no-op implementation. Will be overridden or assigned externally.
+    var isRecordingDidUpdate: (Bool) -> Void = { _ in } {
+        didSet {
+            recordingButton.isRecordingDidUpdate = isRecordingDidUpdate
+        }
     }
     
-    /// Property indicating whether the camera is running, displaying and allow frames to be accessible from the scanner
-    public var cameraIsRunning: Bool {
-        viewModel.cameraIsRunning
+    var didTapToFocus: ((_ touchPoint: CGPoint) -> Void)?
+    
+    var showRecordingButton = false {
+        didSet {
+            recordingButton.isHidden = !showRecordingButton
+        }
     }
     
-    /// Property indicating whether the scanner is running ( attempting to decode barcodes )
-    public var scannerIsRunning: Bool {
-        viewModel.scannerIsRunning
+    var isRecording = false {
+        didSet {
+            recordingButton.isRecording = isRecording
+        }
     }
     
-    public func setMacroModeEnabled(_ enabled: Bool){
-        // This API controls only Osiris's legacy manual algorithm. Automatic
-        // lens selection is chosen through OsirisCameraConfig.lensSwitchingMode.
-        viewModel.cameraManager.update(isMacroMode: enabled ? .on : .off)
-    }
-    
-    public var isMacroModeEnabled: Bool {
-        viewModel.cameraManager.cameraPreferences.isMacroMode.isOn
-    }
-    
-    public var cameraIdleTimeout: TimeInterval?
-    
-    // MARK: Internal Properties
-    
-    let context: OsirisDataCaptureContext
-    public let viewModel: OsirisScannerViewModel = .init()
-    
-    var emptyFrameDetectedTime: TimeInterval?
-    var idleCameraSessionTimer: Timer?
-    
-    var config: OsirisConfig? {
-        OsirisApp.shared.getConfig(forContext: context)
-    }
-    
-    public var scannerView: OsirisScannerView? {
-        self.view as? OsirisScannerView
-    }
-    
-    public func updateVPNEM(_ message: String?){
-        scannerView?.setVPNErrorMessage(message)
-    }
-    
-    var pixelBufferSize: CGSize?
-    var boundingBoxSettings: [BarcodeValue: OsirisBoundingBoxConfig] = [:]
-    
-    var subscriptions: Set<AnyCancellable> = []
+    // Default no-op implementation. Will be overridden or assigned externally.
+    var workItem: DispatchWorkItem = .init(block: {})
 
-    // MARK: Blur Overlay
+    private let magnifyingSymbolConfig = UIImage.SymbolConfiguration(pointSize: 20)
+    
+    public var captureDevice: AVCaptureDevice? {
+        didSet{
+            guard let device = captureDevice else { return }
+            isMacroMode = (device.deviceType == .builtInUltraWideCamera)
+            baseZoomFactor = cameraManager?.baselineZoom(for: device) ?? (isMacroMode ? device.videoZoomFactor : defaultStandardZoom)
+        }
+    }
+    
+    public var isMacroMode: Bool = false
 
-    private var blurOverlayView: UIVisualEffectView?
+    private var resumeOverlayView: UIView?
+    private var resumeTapCallback: (() -> Void)?
+    
+    private enum ToggleZoom { case normal, zoomed
+        var symbol: String {
+            switch self {
+            case .normal: return "plus.magnifyingglass"
+            case .zoomed: return "minus.magnifyingglass"
+            }
+        }
+    }
+
+    private var toggleZoomState: ToggleZoom = .normal
+
+    public func resetZoomToggleState() {
+        toggleZoomState = .normal
+        zoomButton.setImage(UIImage(systemName: ToggleZoom.normal.symbol, withConfiguration: magnifyingSymbolConfig), for: .normal)
+        zoomDescription.isHidden = true
+    }
+    
+    lazy var zoomButton: UIButton = {
+        let image = UIImage(systemName: ToggleZoom.normal.symbol, withConfiguration: magnifyingSymbolConfig)
+        let button = UIButton()
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.tintColor = UIColor.white
+        button.setImage(image, for: .normal)
+        button.frame = .init(origin: .zero, size: .init(width: 32, height: 32))
+        button.addTarget(self, action: #selector(zoomTapped), for: .touchUpInside)
+        return button
+    }()
+    
+    lazy var zoomDescription: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.backgroundColor = .white
+        label.textColor = .black
+        label.layer.cornerRadius = 12
+        label.clipsToBounds = true
+        label.textAlignment = .center
+        label.isHidden = true
+        return label
+    }()
+    
+    lazy var recordingButton: RecordingButton = {
+        let button = RecordingButton(frame: .zero, isRecordingDidUpdate: isRecordingDidUpdate)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        return button
+    }()
+    
+    lazy var boundingBoxes = BarcodeBoundingBoxes()
+    
+    public let videoContainerView: UIView = {
+        let view = UIView()
+        view.backgroundColor = .black
+        view.translatesAutoresizingMaskIntoConstraints = false
+        
+        return view
+    }()
+    
+    private lazy var vpnErrorLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.backgroundColor = UIColor.red.withAlphaComponent(0.8)
+        label.textColor = .white
+        label.textAlignment = .center
+        label.font = UIFont.boldSystemFont(ofSize: 15)
+        label.text = "VPN is off. Please connect VPN"
+        label.isHidden = true
+        return label
+    }()
+    
+    public lazy var fpsStatsLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.5)
+        label.textColor = .white
+        label.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+        label.numberOfLines = 0
+        label.clipsToBounds = true
+        label.textAlignment = .left
+        label.text = ""
+        return label
+    }()
+    
+    private var focusIndicator: UIImageView?
+    
+    private let reticleSize: CGFloat = 240
+    private let context: OsirisDataCaptureContext
+    
+    var reticle = ScannerReticleView()
     
     // MARK: Lifecycle
     
-    public init(context: OsirisDataCaptureContext) {
+    init(frame: CGRect, context: OsirisDataCaptureContext) {
         self.context = context
-        super.init(nibName: nil, bundle: nil)
+        super.init(frame: frame)
+        createView()
+        setLayoutConstraints()
+    }
+    
+    override init(frame: CGRect) {
+        self.context = .init()
+        super.init(frame: frame)
+        createView()
+        setLayoutConstraints()
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
-    private var freezeOverlay: UIView?
-    private var macroFreezeTimeout: DispatchWorkItem?
-    private var awaitingLensSwitchCompletion = false
-    private let macroFrameLock = NSLock()
-    private var macroTransitionID = UUID()
-    private var waitingForFrameAfterSwap = false
-    private let framesToSkipAfterSwap = 3
-    private var postSwapFrameCount = 0
-    
-    public override func viewDidLoad() {
-        super.viewDidLoad()
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        videoPreviewLayer?.frame = videoContainerView.bounds
         
-        setupViews()
-        scannerView?.applyAppearance(config?.scannerAppearance ?? .init())
-        setupSubscriptions()
-        
-        if let scannerView = scannerView {
-            scannerView.cameraManager = viewModel.cameraManager
+        reticle.didLayoutSubviews = { [weak self] in
+            guard let self else { return }
+            self.boundingBoxes.reticlePoint = self.reticle.frame.origin
         }
-        
-        viewModel.cameraManager.onWillSwitchCamera = { [weak self] in
-            guard self?.viewModel.cameraManager.usesAutomaticCameraMode == false else { return }
-            self?.freezePreview()
-        }
-
-        viewModel.cameraManager.onLensSwitchCompleted = { [weak self] succeeded in
-            guard let self = self, self.awaitingLensSwitchCompletion,
-                  self.freezeOverlay != nil else { return }
-            self.awaitingLensSwitchCompletion = false
-            guard succeeded else {
-                self.clearMacroPreviewTransition()
-                return
-            }
-            // Only begin the settling-frame heuristic after the swap and zoom finish.
-            self.macroFrameLock.lock()
-            self.postSwapFrameCount = 0
-            self.waitingForFrameAfterSwap = true
-            self.macroFrameLock.unlock()
-            osirisMacroTrace("WAIT for post-switch callbacks")
-        }
-        
-    }
-    
-    public override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        scannerView?.resetZoomToggleState()
-        
-        // Macro mode is now gated by OsirisFlags.macroModeEnabled in loadCameraSettings().
-        // Do not force-disable here — the feature flag is the single source of truth.
-    }
-    
-    private func freezePreview() {
-        clearMacroPreviewTransition()
-        guard let container = scannerView?.videoContainerView else { return }
-        osirisMacroTrace("FREEZE begin")
-
-        guard let overlay = container.snapshotView(afterScreenUpdates: false) else {
-            osirisMacroTrace("FREEZE skipped; snapshot unavailable")
-            return
-        }
-        overlay.frame = container.bounds
-        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        overlay.isUserInteractionEnabled = false
-        container.addSubview(overlay)
-
-        // The snapshot covers the change; leave the preview connection running.
-        freezeOverlay = overlay
-        awaitingLensSwitchCompletion = true
-        osirisMacroTrace("FREEZE ready")
-
-        // A stopped/interrupted camera must not leave a still image covering the UI.
-        let timeout = DispatchWorkItem { [weak self, weak overlay] in
-            guard let self = self, let overlay = overlay,
-                  self.freezeOverlay === overlay else { return }
-            osirisMacroTrace("FREEZE timeout; revealing preview")
-            self.unfreezePreview()
-        }
-        macroFreezeTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: timeout)
-    }
-    
-    private func unfreezePreview() {
-        guard let overlay = freezeOverlay else { return }
-        macroFreezeTimeout?.cancel()
-        macroFreezeTimeout = nil
-        awaitingLensSwitchCompletion = false
-        cancelMacroFrameWait()
-        osirisMacroTrace("UNFREEZE begin")
-        
-        UIView.animate(withDuration: 0.1, animations: {
-            overlay.alpha = 0
-        }) { [weak self] finished in
-            overlay.removeFromSuperview()
-            if self?.freezeOverlay === overlay {
-                self?.freezeOverlay = nil
-            }
-            osirisMacroTrace("FADE end, completed=\(finished)")
-        }
-    }
-
-    private func cancelMacroFrameWait() {
-        macroFrameLock.lock()
-        waitingForFrameAfterSwap = false
-        postSwapFrameCount = 0
-        macroTransitionID = UUID()
-        macroFrameLock.unlock()
-    }
-
-    private func clearMacroPreviewTransition() {
-        macroFreezeTimeout?.cancel()
-        macroFreezeTimeout = nil
-        awaitingLensSwitchCompletion = false
-        cancelMacroFrameWait()
-        let overlay = freezeOverlay
-        freezeOverlay = nil
-        overlay?.layer.removeAllAnimations()
-        overlay?.removeFromSuperview()
-    }
-    
-    private func centerROISharpness(from pixelBuffer: CVPixelBuffer) -> Double {
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)}
-        
-        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
-              let base = CVPixelBufferGetBaseAddress(pixelBuffer)?.assumingMemoryBound(to: UInt8.self) else {
-            return 0
-        }
-        
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        
-        let roiW = width / 4
-        let roiH = height / 4
-        let startX = (width - roiW) / 2
-        let startY = (height - roiH) / 2
-        
-        let step = 2
-        let gw = roiW / step
-        let gh = roiH / step
-        
-        if gw < 3 || gh < 3 {return 0}
-        
-        var gray = Array(repeating: UInt8(0), count: gw * gh)
-        
-        var gy = 0
-        var y = startY
-        while y < startY + roiH {
-            var gx = 0
-            var x = startX
-            while x < startX + roiW {
-                let off = y * bpr + x * 4
-                let b = Double(base[off + 0])
-                let g = Double(base[off + 1])
-                let r = Double(base[off + 2])
-                
-                let l = UInt8(min(255, max(0, Int(0.114*b + 0.587*g + 0.299*r))))
-                gray[gy * gw + gx] = 1
-                gx += 1
-                x += step
-            }
-            gy += 1
-            y += step
-            
-        }
-        
-        var sum: Double = 0
-          var count = 0
-          for j in 1..<(gh-1) {
-            for i in 1..<(gw-1) {
-              let tl = Int(gray[(j-1)*gw + (i-1)]),  t = Int(gray[(j-1)*gw + i]),    tr = Int(gray[(j-1)*gw + (i+1)])
-              let l  = Int(gray[j*gw + (i-1)]),      _c = Int(gray[j*gw + i]),       r  = Int(gray[j*gw + (i+1)])
-              let bl = Int(gray[(j+1)*gw + (i-1)]),  b = Int(gray[(j+1)*gw + i]),    br = Int(gray[(j+1)*gw + (i+1)])
-
-              let gx = (-tl + tr) + (-2*l + 2*r) + (-bl + br)
-              let gy = (-tl - 2*t - tr) + (bl + 2*b + br)
-              sum += Double(gx*gx + gy*gy)
-              count += 1
-            }
-          }
-          if count == 0 { return 0 }
-          // average gradient energy = "sharpness". Low = blurred.
-          return sum / Double(count)
-    }
-    
-    override public func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        stopCamera()
-        
     }
     
     // MARK: Public API
-    
-    /// `startCamera` starts the camera and begins displaying frames in the scanner view.  This also loads all settings configured in the OsirisApp for the OsirisDataCaptureContext associated with this scanner.
-    /// Make sure `OsirisApp.configure` is called before attempting to run the camera
-    public func startCamera() {
-        Logging.log("cameraIsRunning \(cameraIsRunning)", logLevel: .warning)
-        clearMacroPreviewTransition()
-        scannerView?.applyAppearance(config?.scannerAppearance ?? .init())
-        
-        cancelIdleCameraSessionTimer()
 
-        // Show blur overlay when starting camera to hide jerky frame transitions
-        showBlurOverlay()
-        
-        self.viewModel.updateConfigAndLoadSettings(withConfig: config)
+    /// Applies values belonging to this scanner; no global resource provider is consulted.
+    func applyAppearance(_ appearance: OsirisScannerAppearance) {
+        reticle.reticleColor = appearance.reticleColor
+        reticle.detectedReticleColor = appearance.detectedReticleColor
     }
     
-    /// `stopCamera` stops the camera from processing or displaying more frames - this will freeze the current frame.  This automatically stops scanning if it is currently active.
-    public func stopCamera() {
-        Logging.log("cameraIsRunning \(cameraIsRunning)", logLevel: .warning)
-        clearMacroPreviewTransition()
+    public func reticle(shouldHide: Bool) {
+        reticle.isHidden = shouldHide
+        boundingBoxes.isReticleEnabled = !shouldHide
+    }
+
+    @objc private func handleResumeTap() {
+        videoPreviewLayer?.connection?.isEnabled = true
+        resumeOverlayView?.removeFromSuperview()
+        resumeOverlayView = nil
+        resumeTapCallback?()
+    }
+    
+    // to control visibility of fps Stats label
+    public func fpsStats(shouldHide: Bool) {
+        fpsStatsLabel.isHidden = shouldHide
+    }
+
+    private func handleTapToFocus(_ gesture: UITapGestureRecognizer) {
+        let touchPoint = gesture.location(in: self)
+        didTapToFocus?(touchPoint)
+    }
+    
+    public var baseZoomFactor: CGFloat = 1.5
+    
+    private let defaultStandardZoom: CGFloat = 1.5
+    
+    public weak var cameraManager:CameraManager?
+    
+    @objc private func zoomTapped() {
+        guard let device = cameraManager?.currentDevice else { return }
         
-        stopScanning()
+        let rawNewZoom: CGFloat
         
-        Task { [ weak self ] in
-            try await self?.stopCameraSession()
+        switch toggleZoomState {
+            
+        case .normal:
+            // zoom out → zoom in: always allowed
+            let candidate = device.videoZoomFactor * 2
+            rawNewZoom = min(candidate, device.maxAvailableVideoZoomFactor)
+            toggleZoomState = .zoomed
+            
+        case .zoomed:
+            // zoom in → zoom out: but never below baseZoomFactor
+            let candidate = device.videoZoomFactor / 2
+            let minimum = cameraManager?.baselineZoom(for: device) ?? baseZoomFactor
+            rawNewZoom = max(candidate, minimum)
+            toggleZoomState = .normal
         }
-    }
-    
-    /// `startScanning` starts the barcode decoder and begins processing and scanning the frames from the camera.  If the camera isn't currently running, this will start the camera automatically.
-    public func startScanning() {
-        Logging.log("isScanning \(scannerIsRunning)", logLevel: .warning)
         
-        cancelIdleCameraSessionTimer()
+        // clamp to hardware limits as well ???
+        let newZoom = min(max(rawNewZoom, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
         
-        do {
-            try self.viewModel.startScanning()
-            delegate?.didFireEvent(.didStartScanning)
-            if !self.cameraIsRunning {
-                self.startCamera()
+        cameraManager?.performCameraConfiguration { [weak cameraManager] in
+            guard cameraManager?.currentDevice?.uniqueID == device.uniqueID else { return }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                device.videoZoomFactor = min(max(newZoom, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
+            } catch {
+                print("Zoom failed:", error)
             }
-        } catch {
-            Logging.log("Failed... \(error.localizedDescription)", logLevel: .warning)
         }
+        
+        // update the button icon & label
+        zoomButton.setImage(
+            UIImage(systemName: toggleZoomState.symbol,
+                    withConfiguration: magnifyingSymbolConfig),
+            for: .normal
+        )
+        let standardZoom: CGFloat = cameraManager?.usesAutomaticCameraMode == true ? 1 : defaultStandardZoom
+        let zoomDisplayFactor = (toggleZoomState == .normal) ? standardZoom : standardZoom * 2
+        zoomDescription.text = String(format: "%.1fx", zoomDisplayFactor)
+        setZoomDescriptionVisibility(isHidden: false)
     }
-    
-    /// `stopScanning` stops the barcode decoder and ignores scanning barcodes from any frames coming in from the camera.
-    /// The active camera still runs when scanning is stopped - only no barcode decoding is attempted.
-    public func stopScanning() {
-        Logging.log("isScanning \(scannerIsRunning)", logLevel: .warning)
-        do {
-            try self.viewModel.stopScanning()
-            delegate?.didFireEvent(.didFinishScanning)
-        } catch {
-            Logging.log("Failed... \(error.localizedDescription)", logLevel: .warning)
-        }
-    }
-    
+
     // MARK: Private Helpers
 
-    private func showBlurOverlay() {
-        guard blurOverlayView == nil else { return }
-        let blurEffect = UIBlurEffect(style: .light)
-        let blurView = UIVisualEffectView(effect: blurEffect)
-        blurView.frame = view.bounds
-        blurView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        blurView.alpha = 1.0
+    public func showTapToResumeOverlay(onTap: @escaping () -> Void) {
+        guard resumeOverlayView == nil else { return }
 
-        view.addSubview(blurView)
-        self.blurOverlayView = blurView
-    }
+        let overlay = UIView()
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        overlay.backgroundColor = UIColor.black.withAlphaComponent(0.4)
 
-    private func hideBlurOverlayWithAnimation() {
-        guard let blurView = blurOverlayView else { return }
+        let label = UILabel()
+        label.text = "Tap Anywhere to Resume"
+        label.textColor = .white
+        label.font = UIFont.boldSystemFont(ofSize: 18)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        overlay.addSubview(label)
 
-        UIView.animate(withDuration: 0.2, animations: {
-            blurView.alpha = 0.0
-        }) { _ in
-            blurView.removeFromSuperview()
-            self.blurOverlayView = nil
-        }
-    }
-    
-    private func cancelIdleCameraSessionTimer() {
-        idleCameraSessionTimer?.invalidate()
-        idleCameraSessionTimer = nil
-    }
-    
-    private func setupViews() {
-        let oScannerView = OsirisScannerView(frame: view.bounds, context: context)
-        self.view = oScannerView
-        oScannerView.videoPreviewLayer = AVCaptureVideoPreviewLayer(session: viewModel.cameraManager.session)
-        oScannerView.captureDevice = viewModel.cameraManager.currentDevice
-        oScannerView.didTapToFocus = { [weak self] touchPoint in
-            guard let self = self else {
-                return
-            }
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleResumeTap))
+        overlay.addGestureRecognizer(tap)
+        self.resumeTapCallback = onTap
+        self.resumeOverlayView = overlay
+
+        videoPreviewLayer?.connection?.isEnabled = false
+        videoContainerView.addSubview(overlay)
+
+        NSLayoutConstraint.activate([
+            overlay.topAnchor.constraint(equalTo: videoContainerView.topAnchor),
+            overlay.leadingAnchor.constraint(equalTo: videoContainerView.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: videoContainerView.trailingAnchor),
+            overlay.bottomAnchor.constraint(equalTo: videoContainerView.bottomAnchor),
             
-            let isFocusEnabled = UserDefaults.standard.currentCameraPreferences.isAutoFocus.isOn
-            
-            if isFocusEnabled {
-                self.focus(at: touchPoint)
-            }
-        }
-        oScannerView.isRecordingDidUpdate = { [weak self] isRecording in
-            guard let config = self?.config else {
-                Logging.log("Missing config...", logLevel: .warning)
-                return
-            }
-            guard let context = self?.context else {
-                Logging.log("Missing context...", logLevel: .warning)
-                return
-            }
-            var extras = config.dynamicConfig.extras
-            extras[OsirisBarcodeKey.benchmarkingIsRunning.rawValue] = isRecording
-            do {
-                try OsirisApp.setDynamicExtras(extras, context: context)
-            } catch {
-                Logging.log("Failed! ... \(error.localizedDescription)", logLevel: .warning)
-            }
-        }
-    }
-    
-    private func setupSubscriptions() {
-        subscriptions = [
-            getCameraStatusSubscription(),
-            getBarcodeSubscription(),
-            getBarcodeBoundingBoxSubscription(),
-            getReticleEnabledSubscription(),
-            getFpsStatsEnabledSubscription()
-            
-        ]
-        
-        if let tapSubscription = getBarcodeBoundingBoxTappedSubscription() {
-            subscriptions.insert(tapSubscription)
-        }
-        
-        setupOsirisConfigSubscription()
-        
-        viewModel.cameraManager
-            .$currentDevice
-            .compactMap { $0 }
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] (device: AVCaptureDevice) in
-                guard let self = self else { return }
-                self.scannerView?.captureDevice = device
-                let isMacro = (device.deviceType == .builtInUltraWideCamera)
-                self.scannerView?.isMacroMode = isMacro
-                self.scannerView?.baseZoomFactor = self.viewModel.cameraManager.baselineZoom(for: device)
-            }
-            .store(in: &subscriptions)
-        
-        viewModel.$fpsStatsDisplay
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] text in
-                
-                self?.scannerView?.fpsStatsLabel.text = text
-            }
-            .store(in: &subscriptions)
-    }
-    
-    @MainActor
-    private func startCameraSession() async throws {
-        do {
-            try await self.viewModel.startCamera()
-            delegate?.didFireEvent(.didStartCamera)
-            Logging.log("cameraIsRunning \(cameraIsRunning)", logLevel: .warning)
-        } catch {
-            didReceiveError(error)
-            throw error
-        }
-    }
-    
-    @MainActor
-    private func stopCameraSession() async throws {
-        do {
-            try await self.viewModel.stopCamera()
-//            try OsirisApp.setEnableTorch(false, context: context)
-            delegate?.didFireEvent(.didShutDownCamera)
-            Logging.log("cameraIsRunning \(cameraIsRunning)", logLevel: .warning)
-        } catch {
-            didReceiveError(error)
-            throw error
-        }
-    }
-    
-    private func cameraStatusDidUpdate(toStatus status: CameraManager.Status) {
-        switch status {
-        case .configured:
-            Task { [weak self] in
-                try await self?.startCameraSession()
-            }
-        case .running:
-            let cameraManager: CameraManager = self.viewModel.cameraManager
-            if let scannerView = self.scannerView {
-                self.viewModel.setCameraPreview(withSize: scannerView.videoPreviewLayer?.bounds.size)
-                let frame = scannerView.reticle.frame
-                self.viewModel.setReticle(withFrame: frame)
-            }
-            
-            // Camera status events can fire during teardown re-initialization, briefly turning on
-            // the torch after/when in transition. Delaying dynamic settings application avoids
-            // redundant call. As blur animation is of 0.2 seconds we are adding 0.3 to finish transition.
-            // Increasing 0.3 to 0.5 as low performant devices need more time.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self = self,
-                      self.viewIfLoaded?.window != nil else { return }
-                try? self.viewModel.loadDynamicSettings(fromConfig: self.config?.dynamicConfig)
-            }
-            cameraManager.setOutputSampleBufferDelegate(to: self, queue: nil)
-            
-            // Hide blur overlay with animation when camera is running
-            hideBlurOverlayWithAnimation()
-        case .unconfigured:
-            break
-        default:
-            break
-        }
-    }
-    
-    private func delegateDidUpdate() {
-        viewModel.didReceiveError = { [weak self] error in
-            DispatchQueue.main.async {
-                self?.didReceiveError(error)
-            }
-        }
-        viewModel.didFireEvent = { [weak self] event in
-            DispatchQueue.main.async {
-                self?.processEvent(event)
-            }
-        }
-    }
-    
-    // MARK: Events
-    
-    private func processEvent(_ event: OsirisEvent) {
-        Logging.log("...Forwarding to OsirisScannerDelegate: \(event)", logLevel: .warning)
-        switch event {
-        case .didStartBenchmarkExport:
-            self.delegate?.didFireEvent(.didStartBenchmarkExport)
-        case .didFinishBenchmarkExport(let error):
-            self.delegate?.didFireEvent(.didFinishBenchmarkExport(error))
-            self.scannerView?.isRecording = false
-        case .didStartScanning:
-            self.delegate?.didFireEvent(.didStartScanning)
-        case .didFinishScanning:
-            self.delegate?.didFireEvent(.didFinishScanning)
-        case .didStartRunningBenchmarking:
-            self.delegate?.didFireEvent(.didStartRunningBenchmarking)
-        case .didFinishRunningBenchmarking:
-            self.delegate?.didFireEvent(.didFinishRunningBenchmarking)
-        case .didEnableAllowBenchmarking:
-            self.delegate?.didFireEvent(.didEnableAllowBenchmarking)
-            self.scannerView?.showRecordingButton = true
-        case .didDisableAllowBenchmarking:
-            self.delegate?.didFireEvent(.didDisableAllowBenchmarking)
-            self.scannerView?.showRecordingButton = false
-        case .didStartCamera:
-            self.delegate?.didFireEvent(.didStartCamera)
-        case .didShutDownCamera:
-            self.delegate?.didFireEvent(.didShutDownCamera)
-        case .didFreezeCameraAfterSingleScan:
-            guard viewModel.decoderManager.scanActionType == .single else {
-                return
-            }
-            self.delegate?.didFireEvent(.didFreezeCameraAfterSingleScan)
-        }
-    }
-    
-    private func focus(at point: CGPoint) {
-        
-        guard let device = viewModel.cameraManager.activeCaptureDevice(),
-              let scannerView = scannerView,
-              let previewLayer = scannerView.videoPreviewLayer else {
-            return
-        }
-        
-        scannerView.showFocusSquare(at: point)
-        
-        let focusPoint = previewLayer.captureDevicePointConverted(fromLayerPoint: point)
-        
-        viewModel.cameraManager.focus(at: focusPoint, on: device)
-    }
-    
-    // MARK: Error Handling
-    
-    private func didReceiveError(_ error: Error) {
-        var logLevel: LoggingLevel = .trace
-        switch error {
-        case let error as OsirisBarcodeError:
-            switch error {
-            case .barcodeNotFound:
-                break
-            default:
-                logLevel = .warning
-            }
-        case let error as OsirisScannerError:
-            switch error {
-            case .cameraSessionNotReady, .cameraSessionHasNotStarted:
-                break
-            case .decodingNotReady:
-                break
-            default:
-                logLevel = .warning
-            }
-        default:
-            logLevel = .warning
-        }
-        if logLevel == .warning {
-            delegate?.didReceiveError(error)
-        }
-        Logging.log("... Error: \(error.localizedDescription)", logLevel: logLevel)
-    }
-    
-    // MARK: Deinit
-    
-    deinit {
-        Logging.log("...")
-        NotificationCenter.default.removeObserver(self)
-    }
-    
-}
+            label.centerXAnchor.constraint(equalTo: videoContainerView.centerXAnchor),
+            label.topAnchor.constraint(equalTo: videoContainerView.topAnchor, constant: 120)
 
-// MARK: Subscriptions
-extension OsirisScannerViewController {
-    
-    // MARK: Private Subscriptions
-    
-    private func getCameraStatusSubscription() -> AnyCancellable {
-        viewModel.$cameraStatus.removeDuplicates()
-            .combineLatest(viewModel.sessionManager.$shouldStartCameraSession.removeDuplicates())
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] status, _ in
-                self?.cameraStatusDidUpdate(toStatus: status)
-            }
-        
+        ])
     }
-    
-    private func getBarcodeSubscription() -> AnyCancellable {
-        viewModel.barcodeManager.$barcodes
-            .receive(on: DispatchQueue.main)
-            .sink(receiveValue: { [weak self] barcodes in
-                if let barcode = barcodes.last {
-                    self?.delegate?.didDetectBarcode(barcode)
-                    self?.scannerView?.reticle.toggleReticleColor()
-                }
-            })
-    }
-    
-    private func getBarcodeBoundingBoxTappedSubscription() -> AnyCancellable? {
-        scannerView?.boundingBoxes.$foundBarcodeBox
-            .receive(on: DispatchQueue.main)
-            .sink(receiveValue: { [weak self] foundBarcodeBox in
-                guard let self, let foundBarcodeBox else {
-                    return
-                }
-                
-                let selectedBarcode = foundBarcodeBox.barcode
-                self.delegate?.didTapDetectedBarcodeBoundingBox(selectedBarcode, setBoundingBoxSettings: { settings in
-                    self.boundingBoxSettings[selectedBarcode.value] = settings
-                    self.scannerView?.boundingBoxes.updateBarcodes(self.viewModel.barcodeManager.barcodeBoundingBoxes, customSettings: self.boundingBoxSettings)
-                })
-            })
-    }
-    
-    private func getBarcodeBoundingBoxSubscription() -> AnyCancellable {
-        viewModel.barcodeManager.$barcodeBoundingBoxes
-            .receive(on: DispatchQueue.main)
-            .sink(receiveValue: { [weak self] barcodeBoundingBoxes in
-                for box in barcodeBoundingBoxes {
-                    guard let previewLayer = self?.scannerView?.videoPreviewLayer,
-                          let pixelBufferSize = self?.pixelBufferSize,
-                          !box.barcode.quadPoints.isEmpty else
-                    {
-                        self?.scannerView?.boundingBoxes.resetQuadPoints()
-                        continue
-                    }
-                    
-                    if !box.barcode.quadPoints.isEmpty {
-                        self?.scannerView?.boundingBoxes.registerQuadPoints(
-                            forBarcodeValue: box.barcode.value,
-                            pixelBufferPoints: box.barcode.quadPoints,
-                            previewLayer: previewLayer,
-                            videoOrientation: previewLayer.connection?.videoOrientation ?? .portrait,
-                            isMirrored: false, // Should handle front camera mirroring
-                            pixelBufferSize: pixelBufferSize,
-                            videoZoomFactor: 1.0 // To-be supported..
-                        )
-                    } else {
-                        self?.scannerView?.boundingBoxes.resetQuadPoints()
-                    }
-                }
-                
-                // Draw Default Bounding Boxes
-                self?.scannerView?.boundingBoxes.updateBarcodes(barcodeBoundingBoxes, customSettings: self?.boundingBoxSettings ?? [:])
-                self?.delegate?.didDetectBarcodes(barcodeBoundingBoxes.map(\.barcode), setBoundingBoxesSettings: { settings in
-                    // Re-draw customized boxes
-                    // 1. Merging new settings into existing settings
-                    for (key, newValue) in settings {
-                        // Update or insert the key-value pair
-                        self?.boundingBoxSettings[key] = newValue
-                    }
-                    
-                    // 2. Pass down `boundingBoxSettings` to bounding boxes manager to draw using the given settings.
-                    self?.scannerView?.boundingBoxes.updateBarcodes(barcodeBoundingBoxes, customSettings: self?.boundingBoxSettings ?? [:])
-                })
-            })
-    }
-    
-    private func getReticleEnabledSubscription() -> AnyCancellable {
-        viewModel.decoderManager.$reticleEnabled
-            .receive(on: DispatchQueue.main)
-            .sink(receiveValue: { [weak self] isEnabled in
-                self?.scannerView?.reticle(shouldHide: !isEnabled)
-            })
-    }
-    
-    // to subscribe fpsStats enablement status
-    private func getFpsStatsEnabledSubscription() -> AnyCancellable {
-        viewModel.decoderManager.$fpsStatsEnabled
-            .receive(on: DispatchQueue.main)
-            .sink(receiveValue: { [weak self] isEnabled in
-                self?.scannerView?.fpsStats(shouldHide: !isEnabled)
-            })
-    }
-    
-    private func setupOsirisConfigSubscription() {
-        NotificationCenter.default.publisher(for: .osirisConfigDidUpdate)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                Task { @MainActor in
-                    do {
-                        try await self?.stopCameraSession()
-                        self?.startCamera()
-                        Logging.log("Success... did start camera session", logLevel: .warning)
-                    } catch {
-                        Logging.log("Failed... \(error)", logLevel: .warning)
-                        Logging.log("Updating Config anyway...", logLevel: .warning)
-                        self?.viewModel.updateConfig(withConfig: self?.config)
-                    }
-                }
-            }
-            .store(in: &subscriptions)
-    }
-}
 
-extension OsirisScannerViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
-    private func checkIdleState(_ firstEmptyScan: TimeInterval) {
-        if isCameraIdle(firstEmptyScan) {
-            delegate?.cameraIdleDetected()
-        }
+    // MARK: Private Helpers
+
+    private func createView() {
+        backgroundColor = .white
+        addSubview(videoContainerView)
     }
     
-    private func isCameraIdle(_ firstEmptyScan: TimeInterval) -> Bool {
-        guard let cameraIdleTimeout = cameraIdleTimeout else {
-            return false
-        }
-        
-        let currentTime = Date().timeIntervalSince1970 * 1000
-        return (currentTime - firstEmptyScan) > (cameraIdleTimeout * 1000)
-    }
-    
-    public func captureOutput(_ output: AVCaptureOutput,
-                              didOutput sampleBuffer: CMSampleBuffer,
-                              from connection: AVCaptureConnection) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            return
-        }
-
-        let callbackStart = ProcessInfo.processInfo.systemUptime
-        var tracedFrame: Int? = nil
-
-        defer {
-            if let number = tracedFrame {
-                let ms = Int(
-                    (ProcessInfo.processInfo.systemUptime - callbackStart) * 1_000
-                )
-                osirisMacroTrace("CALLBACK \(number) finished, work_ms=\(ms)")
-            }
-        }
-        
-        macroFrameLock.lock()
-        let transitionID = macroTransitionID
-        var shouldUnfreeze = false
-        if waitingForFrameAfterSwap {
-            postSwapFrameCount += 1
-            tracedFrame = postSwapFrameCount
-            if postSwapFrameCount >= framesToSkipAfterSwap {
-                waitingForFrameAfterSwap = false
-                shouldUnfreeze = true
-            }
-        }
-        macroFrameLock.unlock()
-
-        if let number = tracedFrame {
-            osirisMacroTrace("CALLBACK \(number) received")
-        }
-        if shouldUnfreeze {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.macroFrameLock.lock()
-                let isCurrentTransition = self.macroTransitionID == transitionID
-                self.macroFrameLock.unlock()
-                if isCurrentTransition {
-                    self.unfreezePreview()
-                }
-            }
-        }
-        
-        if viewModel.scannerIsRunning && !viewModel.barcodeManager.barcodes.isEmpty {
-            emptyFrameDetectedTime = nil
+    public func setVPNErrorMessage(_ message:String?){
+        if let message = message, !message.isEmpty {
+            vpnErrorLabel.text = message
+            vpnErrorLabel.isHidden = false
         } else {
-            if emptyFrameDetectedTime == nil {
-                emptyFrameDetectedTime = Date().timeIntervalSince1970 * 1000
-            } else if let emptyFrameDetectedTime = emptyFrameDetectedTime {
-                checkIdleState(emptyFrameDetectedTime)
-            }
+            vpnErrorLabel.isHidden = true
         }
-        
-        if let captureDevice = viewModel.cameraManager.activeCaptureDevice() {
-            viewModel.decoderManager.currentCaptureDevice = captureDevice
+    }
+    
+    /// If we want a square Camera Container in the future - Uncomment height anchor and get rid of bottom anchor
+    private func setLayoutConstraints() {
+        NSLayoutConstraint.activate([
+            videoContainerView.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor),
+            videoContainerView.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor),
+            videoContainerView.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor),
+            videoContainerView.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor)
+            //            videoContainerView.heightAnchor.constraint(equalTo: safeAreaLayoutGuide.widthAnchor)
+        ])
+    }
+    
+    private func setupPreviewLayer() {
+        guard let videoPreviewLayer = videoPreviewLayer else {
+            return
         }
+        videoContainerView.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        videoPreviewLayer.videoGravity = .resizeAspectFill
+        videoPreviewLayer.frame = videoContainerView.bounds
+        videoContainerView.layer.addSublayer(videoPreviewLayer)
+    }
+    
+    private func setupOverlays() {
+        videoContainerView.addSubview(reticle)
+        videoContainerView.addSubview(boundingBoxes)
+        videoContainerView.addSubview(recordingButton)
+        videoContainerView.addSubview(zoomButton)
+        videoContainerView.addSubview(zoomDescription)
+        videoContainerView.addSubview(vpnErrorLabel)
+        videoContainerView.addSubview(fpsStatsLabel)
         
-        if !viewModel.cameraManager.usesAutomaticCameraMode,
-           let pb = CMSampleBufferGetImageBuffer(sampleBuffer){
-            let s = centerROISharpness(from: pb)
-            viewModel.cameraManager.updateSharpnessScore(s)
+        NSLayoutConstraint.activate([
+            reticle.widthAnchor.constraint(equalToConstant: reticleSize),
+            reticle.heightAnchor.constraint(equalToConstant: reticleSize),
+            reticle.centerXAnchor.constraint(equalTo: videoContainerView.centerXAnchor),
+            reticle.centerYAnchor.constraint(equalTo: videoContainerView.centerYAnchor),
             
-            frameCounter += 1
-            if frameCounter % 10 == 0{
-                let sharp = viewModel.cameraManager.sharpnessSmoothed
-                let pos = viewModel.cameraManager.currentDevice?.lensPosition ?? -1
-                let usingUW = (viewModel.cameraManager.currentDevice?.deviceType == .builtInUltraWideCamera)
-//
-//                print(String(format: "[CAL] sharp≈%.1f  lensPos=%.3f  lens=%@",
-//                                 sharp, pos, usingUW ? "UltraWide" : "Wide"))
-                
+            boundingBoxes.centerXAnchor.constraint(equalTo: videoContainerView.centerXAnchor),
+            boundingBoxes.centerYAnchor.constraint(equalTo: videoContainerView.centerYAnchor),
+            boundingBoxes.widthAnchor.constraint(equalTo: videoContainerView.widthAnchor),
+            boundingBoxes.heightAnchor.constraint(equalTo: videoContainerView.heightAnchor),
+            
+            recordingButton.widthAnchor.constraint(equalToConstant: 64),
+            recordingButton.heightAnchor.constraint(equalToConstant: 64),
+            recordingButton.centerXAnchor.constraint(equalTo: videoContainerView.centerXAnchor),
+            recordingButton.topAnchor.constraint(equalTo: reticle.bottomAnchor, constant: 24),
+            
+            vpnErrorLabel.topAnchor.constraint(equalTo: videoContainerView.safeAreaLayoutGuide.topAnchor),
+            vpnErrorLabel.leadingAnchor.constraint(equalTo: videoContainerView.leadingAnchor),
+            vpnErrorLabel.trailingAnchor.constraint(equalTo: videoContainerView.trailingAnchor),
+            vpnErrorLabel.heightAnchor.constraint(equalToConstant: 40),
+            
+            fpsStatsLabel.leadingAnchor.constraint(equalTo: videoContainerView.leadingAnchor, constant: 3),
+            fpsStatsLabel.centerYAnchor.constraint(equalTo: reticle.bottomAnchor,constant: 24),
+            fpsStatsLabel.widthAnchor.constraint(equalToConstant: 170),
+            
+            zoomButton.centerYAnchor.constraint(equalTo: reticle.centerYAnchor),
+            zoomButton.trailingAnchor.constraint(equalTo: reticle.trailingAnchor, constant: 32),
+            
+            zoomDescription.centerXAnchor.constraint(equalTo: reticle.centerXAnchor),
+            zoomDescription.bottomAnchor.constraint(equalTo: reticle.topAnchor, constant: -24),
+            zoomDescription.widthAnchor.constraint(equalToConstant: 64),
+            zoomDescription.heightAnchor.constraint(equalToConstant: 24)
+        ])
+        
+        // Set context to pass down configs.
+        boundingBoxes.context = context
+        boundingBoxes.didTapOnEmptyArea = { [weak self] gesture in
+            self?.handleTapToFocus(gesture)
+        }
+    }
+    
+    private func setZoomDescriptionVisibility(isHidden: Bool) {
+        withAnimation {
+            zoomDescription.isHidden = isHidden
+        }
+        if !isHidden {
+            workItem.cancel()
+            workItem = DispatchWorkItem { [ weak self ] in
+                withAnimation {
+                    self?.zoomDescription.isHidden = true
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: workItem)
+        }
+    }
+    
+    func showFocusSquare(at point: CGPoint) {
+        focusIndicator?.removeFromSuperview()
+        
+        let size: CGFloat = 70
+        
+        let newFocusIndicator = UIImageView()
+        if let focusImage = UIImage(systemName: "camera.metering.center.weighted.average") {
+            newFocusIndicator.image = focusImage.withTintColor(.yellow, renderingMode: .alwaysOriginal)
+            newFocusIndicator.contentMode = .scaleAspectFit
+            newFocusIndicator.frame = CGRect(x: point.x - size/2, y: point.y - size/2, width: size, height: size)
+            
+            addSubview(newFocusIndicator)
+            
+            self.focusIndicator = newFocusIndicator
+            
+            newFocusIndicator.transform = CGAffineTransform(scaleX: 1.5, y: 1.5)
+            newFocusIndicator.alpha = 1.0
+            
+            UIView.animate(withDuration: 0.3, animations: {
+                newFocusIndicator.transform = CGAffineTransform.identity
+            }) { _ in
+                UIView.animate(withDuration: 0.2, delay: 0.5, options: [], animations: {
+                    newFocusIndicator.alpha = 0
+                }) { [weak self] _ in
+                    if self?.focusIndicator == newFocusIndicator {
+                        newFocusIndicator.removeFromSuperview()
+                        self?.focusIndicator = nil
+                    }
+                }
             }
         }
-        
-        viewModel.processBuffer(pixelBuffer)
     }
 }
